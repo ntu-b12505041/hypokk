@@ -66,7 +66,8 @@ The full 2.4 TB waveform database is **not** downloaded.
 ## Installation
 
 ```bash
-cd hypok-mimic3
+git clone https://github.com/ntu-b12505041/hypokk.git
+cd hypokk
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
