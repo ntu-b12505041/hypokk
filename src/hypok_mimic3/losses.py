@@ -3,18 +3,53 @@ from __future__ import annotations
 import numpy as np
 
 
-def effective_number_weights(
-    labels: np.ndarray | list[int],
-    num_classes: int = 3,
-    beta: float = 0.9999,
+def _class_counts(
+    labels: np.ndarray | list[int], num_classes: int
 ) -> np.ndarray:
     labels = np.asarray(labels, dtype=int)
     counts = np.bincount(labels, minlength=num_classes).astype(float)
     if np.any(counts == 0):
         raise ValueError(f"Every training class must have samples; got {counts.tolist()}")
+    return counts
+
+
+def effective_number_weights(
+    labels: np.ndarray | list[int],
+    num_classes: int = 3,
+    beta: float = 0.9999,
+) -> np.ndarray:
+    counts = _class_counts(labels, num_classes)
     weights = (1.0 - beta) / (1.0 - np.power(beta, counts))
     weights = weights / weights.mean()
     return weights.astype(np.float32)
+
+
+def sqrt_inverse_frequency_weights(
+    labels: np.ndarray | list[int], num_classes: int = 3
+) -> np.ndarray:
+    """Softer class correction suitable for use with majority subsampling."""
+
+    counts = _class_counts(labels, num_classes)
+    weights = 1.0 / np.sqrt(counts)
+    weights = weights / weights.mean()
+    return weights.astype(np.float32)
+
+
+def build_class_weights(config: dict, labels: np.ndarray | list[int]) -> np.ndarray:
+    training = config["training"]
+    num_classes = int(config["model"]["num_classes"])
+    method = str(training.get("class_weight_method", "effective_number")).lower()
+    if method == "effective_number":
+        return effective_number_weights(
+            labels,
+            num_classes=num_classes,
+            beta=float(training.get("effective_number_beta", 0.9999)),
+        )
+    if method == "sqrt_inverse_frequency":
+        return sqrt_inverse_frequency_weights(labels, num_classes=num_classes)
+    if method == "none":
+        return np.ones(num_classes, dtype=np.float32)
+    raise ValueError(f"Unsupported training.class_weight_method: {method}")
 
 
 def build_multitask_loss(config: dict, class_weights: np.ndarray):
