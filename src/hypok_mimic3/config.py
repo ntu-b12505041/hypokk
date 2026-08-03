@@ -55,6 +55,31 @@ def validate_config(config: dict[str, Any]) -> None:
     if float(config["preprocess"]["duration_seconds"]) <= 0:
         raise ValueError("preprocess.duration_seconds must be positive")
 
+    class_weight_method = str(
+        config["training"].get("class_weight_method", "effective_number")
+    ).lower()
+    supported_weights = {"effective_number", "sqrt_inverse_frequency", "none"}
+    if class_weight_method not in supported_weights:
+        raise ValueError(
+            f"training.class_weight_method must be one of {sorted(supported_weights)}"
+        )
+
+    sampling = config.get("sampling", {})
+    if sampling.get("enabled", False):
+        if sampling.get("strategy") != "rotating_train_subsample":
+            raise ValueError(
+                "Enabled sampling.strategy must be 'rotating_train_subsample'"
+            )
+        class_name = str(sampling.get("class_name", ""))
+        if class_name not in config["labels"]["names"]:
+            raise ValueError("sampling.class_name must be present in labels.names")
+        if int(sampling.get("windows_per_epoch", 0)) <= 0:
+            raise ValueError("sampling.windows_per_epoch must be positive")
+        if int(sampling.get("max_windows_per_subject_per_class_per_epoch", 0)) < 0:
+            raise ValueError(
+                "sampling.max_windows_per_subject_per_class_per_epoch must be non-negative"
+            )
+
 
 def ensure_output_dirs(config: dict[str, Any]) -> Path:
     output_dir = Path(config["project"]["output_dir"]).expanduser().resolve()

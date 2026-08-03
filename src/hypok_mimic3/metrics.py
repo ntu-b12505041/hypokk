@@ -78,16 +78,26 @@ def classification_metrics(
                 )
             except ValueError:
                 per_class[name]["auprc"] = float("nan")
-        try:
-            result["macro_auroc_ovr"] = float(
-                roc_auc_score(true, probs, labels=labels, multi_class="ovr", average="macro")
-            )
-        except ValueError:
-            result["macro_auroc_ovr"] = float("nan")
-        try:
-            result["macro_auprc"] = float(average_precision_score(targets, probs, average="macro"))
-        except ValueError:
-            result["macro_auprc"] = float("nan")
+
+        # Average the already-computed one-vs-rest metrics. This is equivalent to
+        # macro OVR, while avoiding a fragile multiclass probability-sum check that
+        # can reject concatenated float32 softmax batches and produce a false NaN.
+        class_aurocs = np.asarray(
+            [per_class[name].get("auroc", np.nan) for name in class_names], dtype=float
+        )
+        class_auprcs = np.asarray(
+            [per_class[name].get("auprc", np.nan) for name in class_names], dtype=float
+        )
+        result["macro_auroc_ovr"] = (
+            float(np.nanmean(class_aurocs))
+            if np.any(np.isfinite(class_aurocs))
+            else float("nan")
+        )
+        result["macro_auprc"] = (
+            float(np.nanmean(class_auprcs))
+            if np.any(np.isfinite(class_auprcs))
+            else float("nan")
+        )
     return result
 
 
