@@ -10,9 +10,10 @@ import pandas as pd
 from .calibration import calibrate_predictions
 from .config import ensure_output_dirs
 from .dataset import load_split_datasets
-from .losses import build_multitask_loss, effective_number_weights
+from .losses import build_class_weights, build_multitask_loss
 from .metrics import classification_metrics
 from .model import build_model
+from .sampling import RotatingTrainSubsampler, SamplingSettings
 from .serialization import export_state_dict_h5
 from .utils import seed_everything, write_json
 
@@ -39,6 +40,26 @@ def choose_device(requested: str):
     return torch.device(requested)
 
 
+def _build_train_sampler(config: dict, train_dataset):
+    section = config.get("sampling", {})
+    if not section.get("enabled", False):
+        return None
+    if section.get("strategy") != "rotating_train_subsample":
+        raise ValueError(f"Unsupported sampling.strategy: {section.get('strategy')}")
+    class_names = list(config["labels"]["names"])
+    class_name = str(section["class_name"])
+    settings = SamplingSettings(
+        class_name=class_name,
+        label_id=class_names.index(class_name),
+        windows_per_epoch=int(section["windows_per_epoch"]),
+        max_windows_per_subject_per_class_per_epoch=int(
+            section.get("max_windows_per_subject_per_class_per_epoch", 0)
+        ),
+        seed=int(config["project"]["seed"]),
+    )
+    return RotatingTrainSubsampler(train_dataset.frame, settings)
+
+
 def _make_loaders(config: dict, datasets: dict):
     torch, DataLoader = _torch()
     section = config["training"]
@@ -49,13 +70,21 @@ def _make_loaders(config: dict, datasets: dict):
         "persistent_workers": int(section["num_workers"]) > 0,
     }
     generator = torch.Generator().manual_seed(int(config["project"]["seed"]))
-    return {
-        "train": DataLoader(
-            datasets["train"], shuffle=True, generator=generator, drop_last=False, **common
-        ),
+    train_sampler = _build_train_sampler(config, datasets["train"])
+    train_loader = DataLoader(
+        datasets["train"],
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        generator=generator,
+        drop_last=False,
+        **common,
+    )
+    loaders = {
+        "train": train_loader,
         "validation": DataLoader(datasets["validation"], shuffle=False, drop_last=False, **common),
         "test": DataLoader(datasets["test"], shuffle=False, drop_last=False, **common),
     }
+    return loaders, train_sampler
 
 
 def _optimizer_and_scheduler(config: dict, model, steps_per_epoch: int):
@@ -197,6 +226,13 @@ def collect_predictions(model, loader, device) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _grad_scaler(torch, use_amp: bool):
+    try:
+        return torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (AttributeError, TypeError):  # PyTorch compatibility fallback
+        return torch.cuda.amp.GradScaler(enabled=use_amp)
+
+
 def train_model(config: dict) -> dict:
     torch, _ = _torch()
     import scipy
@@ -207,13 +243,15 @@ def train_model(config: dict) -> dict:
     seed_everything(seed)
     output_dir = ensure_output_dirs(config)
     datasets = load_split_datasets(config)
-    loaders = _make_loaders(config, datasets)
-    train_labels = datasets["train"].frame["label_id"].to_numpy()
-    class_weights = effective_number_weights(
-        train_labels,
-        num_classes=int(config["model"]["num_classes"]),
-        beta=float(config["training"]["effective_number_beta"]),
-    )
+    loaders, train_sampler = _make_loaders(config, datasets)
+
+    if train_sampler is None:
+        weighting_labels = datasets["train"].frame["label_id"].to_numpy()
+    else:
+        initial_indices = train_sampler.indices_for_epoch(0)
+        weighting_labels = datasets["train"].frame.iloc[initial_indices]["label_id"].to_numpy()
+    class_weights = build_class_weights(config, weighting_labels)
+
     model = build_model(config)
     freeze_backbone_epochs = int(config["model"].get("freeze_backbone_epochs", 0))
     if freeze_backbone_epochs > 0:
@@ -229,16 +267,24 @@ def train_model(config: dict) -> dict:
     loss_fn = build_multitask_loss(config, class_weights)
     optimizer, scheduler = _optimizer_and_scheduler(config, model, len(loaders["train"]))
     use_amp = bool(config["training"]["mixed_precision"]) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = _grad_scaler(torch, use_amp)
 
     best_score = -np.inf
     best_epoch = -1
     epochs_without_improvement = 0
     patience = int(config["training"]["early_stopping_patience"])
     history = []
+    sampling_audits = []
     checkpoint_path = output_dir / "checkpoints" / "best.pt"
+    sampling_cfg = config.get("sampling", {})
+    manifest_dir = output_dir / "logs" / "sampling_manifests"
+    if train_sampler is not None and sampling_cfg.get("save_epoch_manifests", True):
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+
     started = time.perf_counter()
     for epoch in range(1, int(config["training"]["epochs"]) + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch - 1)
         if freeze_backbone_epochs > 0 and epoch == freeze_backbone_epochs + 1:
             model.unfreeze_backbone()
         train_stats = _run_epoch(
@@ -251,6 +297,12 @@ def train_model(config: dict) -> dict:
             scaler=scaler,
             gradient_clip_norm=float(config["training"]["gradient_clip_norm"]),
         )
+        if train_sampler is not None:
+            sampling_audits.append(train_sampler.audit_frame(list(config["labels"]["names"])))
+            if sampling_cfg.get("save_epoch_manifests", True):
+                train_sampler.manifest_frame().to_csv(
+                    manifest_dir / f"epoch_{epoch:03d}.csv", index=False
+                )
         with torch.inference_mode():
             val_stats = _run_epoch(model, loaders["validation"], loss_fn, device)
         row = {"epoch": epoch, "learning_rate": optimizer.param_groups[0]["lr"]}
@@ -284,6 +336,11 @@ def train_model(config: dict) -> dict:
     elapsed = time.perf_counter() - started
     history_frame = pd.DataFrame(history)
     history_frame.to_csv(output_dir / "logs" / "training_history.csv", index=False)
+    if sampling_audits:
+        pd.concat(sampling_audits, ignore_index=True).to_csv(
+            output_dir / "logs" / "sampling_audit.csv", index=False
+        )
+
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     h5_checkpoint_path = export_state_dict_h5(
@@ -325,6 +382,9 @@ def train_model(config: dict) -> dict:
         "gpu_name": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
         "cuda_version": torch.version.cuda,
     }
+    sampled_counts = np.bincount(
+        np.asarray(weighting_labels, dtype=int), minlength=int(config["model"]["num_classes"])
+    )
     summary = {
         "best_epoch": best_epoch,
         "best_validation_score": best_score,
@@ -333,7 +393,10 @@ def train_model(config: dict) -> dict:
         "epochs_completed": len(history),
         "checkpoint": str(checkpoint_path),
         "h5_checkpoint": str(h5_checkpoint_path),
+        "class_weight_method": config["training"].get("class_weight_method", "effective_number"),
         "class_weights": class_weights.tolist(),
+        "weighting_class_counts": sampled_counts.tolist(),
+        "sampling": sampling_cfg if train_sampler is not None else {"enabled": False},
         "environment": environment,
         "validation_target_met": calibration.target_met_on_validation,
         "total_parameters": int(total_parameters),
